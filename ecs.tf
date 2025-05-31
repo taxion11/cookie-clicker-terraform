@@ -1,6 +1,45 @@
 # terraform/ecs.tf
 
 #===========================================
+# Service Discovery (追加)
+#===========================================
+
+# Service Discovery Namespace
+resource "aws_service_discovery_private_dns_namespace" "main" {
+  name        = "${local.project_name}.local"
+  description = "Service discovery namespace for ${local.project_name}"
+  vpc         = aws_vpc.main.id
+
+  tags = merge(local.common_tags, {
+    Name = "${local.project_name}-${local.environment}-service-discovery"
+  })
+}
+
+# Python API Service Discovery Service
+resource "aws_service_discovery_service" "python_api" {
+  name = "python-api"
+
+  dns_config {
+    namespace_id = aws_service_discovery_private_dns_namespace.main.id
+
+    dns_records {
+      ttl  = 60
+      type = "A"
+    }
+
+    routing_policy = "MULTIVALUE"
+  }
+
+  health_check_custom_config {
+    failure_threshold = 1
+  }
+
+  tags = merge(local.common_tags, {
+    Name = "${local.project_name}-${local.environment}-service-discovery-python"
+  })
+}
+
+#===========================================
 # ECS Cluster
 #===========================================
 
@@ -127,7 +166,7 @@ resource "aws_iam_role_policy" "ecs_task_dynamodb" {
 }
 
 #===========================================
-# ECS Security Group
+# ECS Security Group (修正)
 #===========================================
 
 resource "aws_security_group" "ecs" {
@@ -135,20 +174,22 @@ resource "aws_security_group" "ecs" {
   description = "Security group for ECS tasks"
   vpc_id      = aws_vpc.main.id
   
+  # Go App - ALBからのアクセス
   ingress {
-    description     = "Go App Port"
+    description     = "Go App Port from ALB"
     from_port       = var.go_app_port
     to_port         = var.go_app_port
     protocol        = "tcp"
     security_groups = [aws_security_group.alb.id]
   }
   
+  # Python API - ECS内部通信のみ (ALBアクセス削除)
   ingress {
-    description     = "Python API Port"
-    from_port       = var.python_api_port
-    to_port         = var.python_api_port
-    protocol        = "tcp"
-    security_groups = [aws_security_group.alb.id]
+    description = "Python API Port from ECS internal"
+    from_port   = var.python_api_port
+    to_port     = var.python_api_port
+    protocol    = "tcp"
+    self        = true  # 同じセキュリティグループ内での通信のみ許可
   }
   
   egress {
@@ -164,8 +205,9 @@ resource "aws_security_group" "ecs" {
 }
 
 #===========================================
-# ECS Task Definitions
+# ECS Task Definitions (修正)
 #===========================================
+
 resource "aws_ecs_task_definition" "go_app" {
   family                   = "${local.project_name}-${local.environment}-ecs-task-go"
   network_mode             = "awsvpc"
@@ -210,6 +252,11 @@ resource "aws_ecs_task_definition" "go_app" {
         {
           name  = "GIN_MODE"
           value = "release"
+        },
+        # 🔥 Service Discovery URL追加
+        {
+          name  = "PYTHON_API_URL"
+          value = "http://python-api.${local.project_name}.local:${var.python_api_port}"
         }
       ]
       
@@ -231,7 +278,6 @@ resource "aws_ecs_task_definition" "go_app" {
     Name = "${local.project_name}-${local.environment}-ecs-task-go"
   })
 }
-
 
 resource "aws_ecs_task_definition" "python_api" {
   family                   = "${local.project_name}-${local.environment}-ecs-task-python"
@@ -277,6 +323,14 @@ resource "aws_ecs_task_definition" "python_api" {
         {
           name  = "LOG_LEVEL"
           value = "INFO"
+        },
+        {
+          name  = "HOST"
+          value = "0.0.0.0"
+        },
+        {
+          name  = "PORT"
+          value = tostring(var.python_api_port)
         }
       ]
       
@@ -285,10 +339,10 @@ resource "aws_ecs_task_definition" "python_api" {
           "CMD-SHELL",
           "curl -f http://localhost:${var.python_api_port}/health || exit 1"
         ]
-        interval    = 30
-        timeout     = 5
-        retries     = 3
-        startPeriod = 60
+        interval    = 60      # 30秒 → 60秒に延長
+        timeout     = 15      # 5秒 → 15秒に延長  
+        retries     = 5       # 3回 → 5回に増加
+        startPeriod = 300     # 60秒 → 300秒（5分）に延長
       }
     }
   ])
@@ -299,9 +353,10 @@ resource "aws_ecs_task_definition" "python_api" {
 }
 
 #===========================================
-# ECS Services
+# ECS Services (修正)
 #===========================================
 
+# Go Frontend Service (ALB接続)
 resource "aws_ecs_service" "go_app" {
   name            = "${local.project_name}-${local.environment}-ecs-service-go"
   cluster         = aws_ecs_cluster.main.id
@@ -333,29 +388,33 @@ resource "aws_ecs_service" "go_app" {
   })
 }
 
+# Python API Service (内部専用、Service Discovery付き)
 resource "aws_ecs_service" "python_api" {
   name            = "${local.project_name}-${local.environment}-ecs-service-python"
   cluster         = aws_ecs_cluster.main.id
   task_definition = aws_ecs_task_definition.python_api.arn
   desired_count   = var.ecs_desired_count
   launch_type     = "FARGATE"
+  health_check_grace_period_seconds = 300  # 5分の猶予
 
   network_configuration {
     subnets          = aws_subnet.private[*].id
     security_groups  = [aws_security_group.ecs.id]
-    assign_public_ip = false
+    assign_public_ip = false  # パブリックIP不要（内部専用）
   }
 
-  load_balancer {
-    target_group_arn = aws_lb_target_group.python_api.arn
-    container_name   = "cookie-clicker-python"
-    container_port   = var.python_api_port
+  # 🔥 Service Discovery 登録追加
+  service_registries {
+    registry_arn = aws_service_discovery_service.python_api.arn
   }
+
+  # 🔥 ALB Target Group削除（内部専用のため）
+  # load_balancer ブロックを削除
 
   depends_on = [
-    aws_lb_listener.main,
     aws_iam_role_policy.ecs_task_dynamodb,
-    aws_ecs_task_definition.python_api
+    aws_ecs_task_definition.python_api,
+    aws_service_discovery_service.python_api
   ]
 
   tags = merge(local.common_tags, {

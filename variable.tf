@@ -51,6 +51,16 @@ variable "private_subnet_cidrs" {
   default     = ["10.0.10.0/24", "10.0.20.0/24"]
 }
 
+#===========================================
+# Service Discovery Configuration (追加)
+#===========================================
+
+variable "service_discovery_namespace" {
+  description = "Service Discovery namespace name"
+  type        = string
+  default     = "cookie-clicker.local"
+}
+
 # ECS Configuration
 variable "ecs_cpu" {
   description = "CPU units for ECS tasks"
